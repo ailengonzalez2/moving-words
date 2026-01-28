@@ -1,0 +1,23 @@
+{
+  "name": "moving-words",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "nuxt dev",
+    "build": "nuxt build",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare",
+    "typecheck": "nuxt typecheck"
+  },
+  "dependencies": {
+    "@nuxt/ui": "^4.4.0",
+    "@tresjs/core": "^5.3.3",
+    "nuxt": "^4.3.0",
+    "three": "^0.182.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/three": "^0.182.0",
+    "typescript": "^5.0.0"
+  }
+}

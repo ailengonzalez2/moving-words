@@ -1,21 +1,25 @@
 <script setup lang="ts">
-// Page will contain the Three.js interactive banner
+const handleRestart = () => {
+  // TODO: Implement restart logic for Three.js scene
+  console.log('Restart animation')
+}
 </script>
 
 <template>
   <div class="relative w-full h-screen">
-    <!-- Three.js canvas will go here -->
-    <div class="absolute inset-0 flex items-center justify-center">
-      <h1 class="text-4xl font-bold text-white">Moving Words</h1>
+    <!-- Three.js canvas -->
+    <div class="absolute inset-0">
+      <ThreeScene />
     </div>
 
     <!-- Restart button (bottom right) -->
-    <div class="absolute bottom-8 right-8">
+    <div class="absolute bottom-8 right-8 z-10">
       <UButton
         label="Restart"
         color="white"
         variant="solid"
         size="lg"
+        @click="handleRestart"
       />
     </div>
   </div>

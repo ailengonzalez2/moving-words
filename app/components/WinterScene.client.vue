@@ -75,8 +75,11 @@ interface Fragment {
   opacity: number
   age: number
   maxAge: number
-  leftH: number
-  rightH: number
+  // 4 corners of irregular quadrilateral (local space within [-0.5, 0.5])
+  v0x: number; v0y: number
+  v1x: number; v1y: number
+  v2x: number; v2y: number
+  v3x: number; v3y: number
   alive: boolean
 }
 
@@ -86,13 +89,14 @@ for (let i = 0; i < MAX_FRAGMENTS; i++) {
     x: 0, y: 0, vx: 0, vy: 0,
     rotation: 0, rotSpeed: 0, size: 0,
     opacity: 0, age: 0, maxAge: 1,
-    leftH: 0.5, rightH: 0.5, alive: false,
+    v0x: 0, v0y: 0, v1x: 0, v1y: 0,
+    v2x: 0, v2y: 0, v3x: 0, v3y: 0,
+    alive: false,
   })
 }
 let nextFragIdx = 0
 let spawnAccumulator = 0
-let lastFragSize = 14
-let lastRightH = 0.4
+let lastFragSize = 50
 
 // Irregular crack width state
 let brushWidthWander = 1.0
@@ -207,26 +211,26 @@ void main() {
 }
 `
 
-// ── Fragment particle shader ──
+// ── Fragment particle shader (irregular polygon shards) ──
 const fragVertex = /* glsl */ `
 attribute float aOpacity;
 attribute float aRotation;
 attribute float aSize;
-attribute float aLeftH;
-attribute float aRightH;
+attribute vec4 aV01;
+attribute vec4 aV23;
 
 varying float vOpacity;
 varying float vRotation;
-varying float vLeftH;
-varying float vRightH;
+varying vec4 vV01;
+varying vec4 vV23;
 
 uniform float uPixelRatio;
 
 void main() {
   vOpacity  = aOpacity;
   vRotation = aRotation;
-  vLeftH    = aLeftH;
-  vRightH   = aRightH;
+  vV01 = aV01;
+  vV23 = aV23;
   gl_Position  = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
   gl_PointSize = aSize * uPixelRatio;
 }
@@ -236,8 +240,19 @@ const fragFragment = /* glsl */ `
 precision highp float;
 varying float vOpacity;
 varying float vRotation;
-varying float vLeftH;
-varying float vRightH;
+varying vec4 vV01;
+varying vec4 vV23;
+
+float cross2d(vec2 a, vec2 b) {
+  return a.x * b.y - a.y * b.x;
+}
+
+float distToSegment(vec2 p, vec2 a, vec2 b) {
+  vec2 ab = b - a;
+  vec2 ap = p - a;
+  float t = clamp(dot(ap, ab) / dot(ab, ab), 0.0, 1.0);
+  return length(p - (a + ab * t));
+}
 
 void main() {
   if (vOpacity < 0.01) discard;
@@ -247,43 +262,58 @@ void main() {
   float s = sin(vRotation);
   uv = vec2(uv.x * c - uv.y * s, uv.x * s + uv.y * c);
 
-  // Width bounds
-  if (abs(uv.x) > 0.42) discard;
+  // Reconstruct 4 corners of the irregular quadrilateral
+  vec2 v0 = vV01.xy;
+  vec2 v1 = vV01.zw;
+  vec2 v2 = vV23.xy;
+  vec2 v3 = vV23.zw;
 
-  // Height interpolates from leftH to rightH across x
-  float t = (uv.x + 0.42) / 0.84;
-  float halfH = mix(vLeftH, vRightH, t) * 0.5;
+  // Point-in-convex-quad test (works for CW or CCW winding)
+  float c0 = cross2d(v1 - v0, uv - v0);
+  float c1 = cross2d(v2 - v1, uv - v1);
+  float c2 = cross2d(v3 - v2, uv - v2);
+  float c3 = cross2d(v0 - v3, uv - v3);
 
-  // Vertical offset tilts the shape
-  float leftOff  = (fract(sin(vLeftH * 127.1 + vRightH * 311.7) * 43758.5) - 0.5) * 0.1;
-  float rightOff = (fract(sin(vRightH * 269.5 + vLeftH * 183.3) * 43758.5) - 0.5) * 0.1;
-  float off = mix(leftOff, rightOff, t);
+  bool allPos = c0 > 0.0 && c1 > 0.0 && c2 > 0.0 && c3 > 0.0;
+  bool allNeg = c0 < 0.0 && c1 < 0.0 && c2 < 0.0 && c3 < 0.0;
+  if (!(allPos || allNeg)) discard;
 
-  if (abs(uv.y - off) > halfH) discard;
+  // Distance to nearest edge for anti-aliasing and bevel
+  float e0 = distToSegment(uv, v0, v1);
+  float e1 = distToSegment(uv, v1, v2);
+  float e2 = distToSegment(uv, v2, v3);
+  float e3 = distToSegment(uv, v3, v0);
+  float minEdge = min(min(e0, e1), min(e2, e3));
 
-  // Fake surface normal from UV position for 3D lighting
-  vec2 centered = vec2(uv.x / 0.42, (uv.y - off) / halfH);
-  vec3 fakeNormal = normalize(vec3(centered.x * 0.3, centered.y * 0.3, 1.0));
+  // Smooth anti-aliasing at edges
+  float aa = smoothstep(0.0, 0.012, minEdge);
 
-  // Directional lighting (same light as background bevel)
+  // Edge bevel darkening (thicker shards feel)
+  float bevel = smoothstep(0.0, 0.07, minEdge);
+
+  // Face normal: slightly tilted based on shape asymmetry (glass shard effect)
+  vec2 center = (v0 + v1 + v2 + v3) * 0.25;
+  vec3 faceN = normalize(vec3(-center * 0.6, 1.0));
+
+  // Directional lighting (matches background bevel light)
   vec3 lightDir = normalize(vec3(-0.5, 0.5, 1.0));
-  float diffuse = max(dot(fakeNormal, lightDir), 0.0);
-  float lighting = 0.2 + diffuse * 0.8; // 0.2 ambient minimum
+  float diffuse = max(dot(faceN, lightDir), 0.0);
+  float lighting = 0.25 + diffuse * 0.75;
 
-  // Specular highlight
+  // Sharp specular for glass-like highlight
   vec3 viewDir = vec3(0.0, 0.0, 1.0);
   vec3 halfVec = normalize(lightDir + viewDir);
-  float spec = pow(max(dot(fakeNormal, halfVec), 0.0), 16.0);
+  float spec = pow(max(dot(faceN, halfVec), 0.0), 24.0);
 
-  // Edge darkening
-  float edgeFactor = length(centered);
-  float edgeDarken = smoothstep(0.4, 0.6, edgeFactor);
-
+  // Dark surface fragment color
   vec3 baseCol = vec3(0.12, 0.12, 0.14);
-  vec3 col = baseCol * lighting + vec3(1.0) * spec * 0.15;
-  col *= (1.0 - edgeDarken * 0.4);
+  vec3 col = baseCol * lighting + vec3(1.0) * spec * 0.18;
 
-  gl_FragColor = vec4(col, vOpacity);
+  // Bevel: darken edges with subtle cool tint
+  col *= mix(0.5, 1.0, bevel);
+  col += vec3(0.02, 0.03, 0.06) * (1.0 - bevel);
+
+  gl_FragColor = vec4(col, vOpacity * aa);
 }
 `
 
@@ -416,15 +446,15 @@ function init() {
   const opa = new Float32Array(MAX_FRAGMENTS)
   const rot = new Float32Array(MAX_FRAGMENTS)
   const siz = new Float32Array(MAX_FRAGMENTS)
-  const lh  = new Float32Array(MAX_FRAGMENTS)
-  const rh  = new Float32Array(MAX_FRAGMENTS)
+  const v01 = new Float32Array(MAX_FRAGMENTS * 4)
+  const v23 = new Float32Array(MAX_FRAGMENTS * 4)
 
   fragGeo.setAttribute('position', new BufferAttribute(pos, 3))
   fragGeo.setAttribute('aOpacity', new BufferAttribute(opa, 1))
   fragGeo.setAttribute('aRotation', new BufferAttribute(rot, 1))
   fragGeo.setAttribute('aSize', new BufferAttribute(siz, 1))
-  fragGeo.setAttribute('aLeftH', new BufferAttribute(lh, 1))
-  fragGeo.setAttribute('aRightH', new BufferAttribute(rh, 1))
+  fragGeo.setAttribute('aV01', new BufferAttribute(v01, 4))
+  fragGeo.setAttribute('aV23', new BufferAttribute(v23, 4))
 
   fragMat = new ShaderMaterial({
     vertexShader: fragVertex,
@@ -446,7 +476,6 @@ function init() {
   for (const f of fragments) f.alive = false
   nextFragIdx = 0
   spawnAccumulator = 0
-  lastRightH = 0.35 + Math.random() * 0.35
   brushWidthWander = 1.0
   brushWidthTarget = 1.0
   brushWidthTimer = 0
@@ -501,7 +530,7 @@ function paintCrackMap() {
 
   const cx = mouse.current.x * CRACK_RES
   const cy = mouse.current.y * CRACK_RES
-  const r = Math.ceil(dynamicRadius * 1.3) // extra margin for edge noise
+  const r = Math.ceil(dynamicRadius)
   const xMin = Math.max(0, Math.floor(cx - r))
   const xMax = Math.min(CRACK_RES - 1, Math.ceil(cx + r))
   const yMin = Math.max(0, Math.floor(cy - r))
@@ -513,15 +542,8 @@ function paintCrackMap() {
       const tdy = py - cy
       const dist = Math.sqrt(tdx * tdx + tdy * tdy)
 
-      // Spatial noise in 4px blocks for rough edges
-      const bx = px >> 2
-      const by = py >> 2
-      const h = Math.sin(bx * 12.9898 + by * 78.233) * 43758.5453
-      const edgeNoise = (h - Math.floor(h)) * 0.5 - 0.25
-      const effectiveRadius = dynamicRadius * (1.0 + edgeNoise)
-
-      if (dist > effectiveRadius) continue
-      const t = dist / effectiveRadius
+      if (dist > dynamicRadius) continue
+      const t = dist / dynamicRadius
       const falloff = 1.0 - t * t * (3.0 - 2.0 * t)
       const idx = (py * CRACK_RES + px) * 4
       const newVal = Math.min(255, crackData[idx]! + falloff * strength * 255)
@@ -564,17 +586,40 @@ function spawnFragment(mx: number, my: number, mvx: number, mvy: number) {
   f.rotation = Math.random() * Math.PI * 2
   f.rotSpeed = (Math.random() - 0.5) * 0.03
   if (Math.random() < 0.2) {
-    lastFragSize = 22 + Math.random() * 28
+    lastFragSize = 50 + Math.random() * 50
   }
   f.size = lastFragSize
   f.opacity = 0.55 + Math.random() * 0.35
   f.age = 0
   f.maxAge = 90 + Math.random() * 120
 
-  // Chain edge heights: left = previous right, right = new random
-  f.leftH = lastRightH
-  f.rightH = 0.3 + Math.random() * 0.45
-  lastRightH = f.rightH
+  // Generate irregular quadrilateral corners (shattered glass shard shape)
+  // Polar method: 4 corners at roughly cardinal angles with randomized
+  // distance and angle — guarantees convex polygon with organic irregularity
+  const angSpread = 0.5
+  const angles = [
+    Math.PI * 0.75 + (Math.random() - 0.5) * angSpread,
+    Math.PI * 0.25 + (Math.random() - 0.5) * angSpread,
+    -Math.PI * 0.25 + (Math.random() - 0.5) * angSpread,
+    -Math.PI * 0.75 + (Math.random() - 0.5) * angSpread,
+  ]
+  // Random stretch creates elongated or squashed shards
+  const sx2 = 0.7 + Math.random() * 0.6
+  const sy2 = 0.7 + Math.random() * 0.6
+
+  const d0 = 0.2 + Math.random() * 0.18
+  const d1 = 0.2 + Math.random() * 0.18
+  const d2 = 0.2 + Math.random() * 0.18
+  const d3 = 0.2 + Math.random() * 0.18
+
+  f.v0x = Math.cos(angles[0]!) * d0 * sx2
+  f.v0y = Math.sin(angles[0]!) * d0 * sy2
+  f.v1x = Math.cos(angles[1]!) * d1 * sx2
+  f.v1y = Math.sin(angles[1]!) * d1 * sy2
+  f.v2x = Math.cos(angles[2]!) * d2 * sx2
+  f.v2y = Math.sin(angles[2]!) * d2 * sy2
+  f.v3x = Math.cos(angles[3]!) * d3 * sx2
+  f.v3y = Math.sin(angles[3]!) * d3 * sy2
 
   f.alive = true
 }
@@ -585,7 +630,7 @@ function spawnFragments() {
   const velocity = Math.sqrt(dx * dx + dy * dy)
   if (velocity < 0.0005) return
 
-  spawnAccumulator += velocity * 125
+  spawnAccumulator += velocity * 8
   while (spawnAccumulator >= 1) {
     spawnFragment(mouse.current.x, mouse.current.y, dx, dy)
     spawnAccumulator -= 1
@@ -600,8 +645,8 @@ function updateFragments() {
   const opaArr = (fragGeo.getAttribute('aOpacity') as BufferAttribute).array as Float32Array
   const rotArr = (fragGeo.getAttribute('aRotation') as BufferAttribute).array as Float32Array
   const sizArr = (fragGeo.getAttribute('aSize') as BufferAttribute).array as Float32Array
-  const lhArr  = (fragGeo.getAttribute('aLeftH') as BufferAttribute).array as Float32Array
-  const rhArr  = (fragGeo.getAttribute('aRightH') as BufferAttribute).array as Float32Array
+  const v01Arr = (fragGeo.getAttribute('aV01') as BufferAttribute).array as Float32Array
+  const v23Arr = (fragGeo.getAttribute('aV23') as BufferAttribute).array as Float32Array
 
   for (let i = 0; i < MAX_FRAGMENTS; i++) {
     const f = fragments[i]!
@@ -634,16 +679,24 @@ function updateFragments() {
     opaArr[i] = f.opacity
     rotArr[i] = f.rotation
     sizArr[i] = f.size
-    lhArr[i] = f.leftH
-    rhArr[i] = f.rightH
+
+    const i4 = i * 4
+    v01Arr[i4]     = f.v0x
+    v01Arr[i4 + 1] = f.v0y
+    v01Arr[i4 + 2] = f.v1x
+    v01Arr[i4 + 3] = f.v1y
+    v23Arr[i4]     = f.v2x
+    v23Arr[i4 + 1] = f.v2y
+    v23Arr[i4 + 2] = f.v3x
+    v23Arr[i4 + 3] = f.v3y
   }
 
   fragGeo.getAttribute('position')!.needsUpdate = true
   fragGeo.getAttribute('aOpacity')!.needsUpdate = true
   fragGeo.getAttribute('aRotation')!.needsUpdate = true
   fragGeo.getAttribute('aSize')!.needsUpdate = true
-  fragGeo.getAttribute('aLeftH')!.needsUpdate = true
-  fragGeo.getAttribute('aRightH')!.needsUpdate = true
+  fragGeo.getAttribute('aV01')!.needsUpdate = true
+  fragGeo.getAttribute('aV23')!.needsUpdate = true
 }
 
 // ── Animation loop ──

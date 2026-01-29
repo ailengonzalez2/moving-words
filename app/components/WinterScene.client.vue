@@ -55,7 +55,7 @@ const CRACK_RES = 512
 const BRUSH_RADIUS = 30
 const PAINT_STRENGTH = 0.4
 const LERP_FACTOR = 0.12
-const MAX_FRAGMENTS = 200
+const MAX_FRAGMENTS = 4
 
 // Mouse state (UV space: 0–1)
 const mouse = {
@@ -95,12 +95,12 @@ for (let i = 0; i < MAX_FRAGMENTS; i++) {
   })
 }
 let nextFragIdx = 0
-let spawnAccumulator = 0
-let lastFragSize = 50
 
 // Trail state for angular polygon path
-let trailHalfWidth = 0.04
-let trailHalfWidthTarget = 0.04
+let trailLeftHW = 0.06
+let trailLeftHWTarget = 0.06
+let trailRightHW = 0.06
+let trailRightHWTarget = 0.06
 let trailWidthTimer = 0
 let lastSegX = 0.5
 let lastSegY = 0.5
@@ -110,7 +110,7 @@ let prevRightX = 0
 let prevRightY = 0
 let trailStarted = false
 let trailHasSegment = false
-const MIN_SEG_DIST = 0.025
+const MIN_SEG_DIST = 0.045
 
 // ── Mouse handler ──
 function onMouseMove(e: MouseEvent) {
@@ -361,7 +361,7 @@ void main() {
   float fresnel = 1.0 - z;
   fresnel = fresnel * fresnel;
 
-  vec3 bgColor = vec3(0.96);
+  vec3 bgColor = vec3(1.0);
   vec3 sphereColor = vec3(shading);
 
   // Blend sphere into background at edges via fresnel
@@ -385,7 +385,7 @@ function init() {
   camera.position.z = 1
 
   renderer = new WebGLRenderer({ alpha: false })
-  renderer.setClearColor(0xf5f5f5)
+  renderer.setClearColor(0xffffff)
   renderer.setSize(w, h)
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
   renderer.domElement.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;'
@@ -484,9 +484,10 @@ function init() {
   // Reset pool
   for (const f of fragments) f.alive = false
   nextFragIdx = 0
-  spawnAccumulator = 0
-  trailHalfWidth = 0.04
-  trailHalfWidthTarget = 0.04
+  trailLeftHW = 0.06
+  trailLeftHWTarget = 0.06
+  trailRightHW = 0.06
+  trailRightHWTarget = 0.06
   trailWidthTimer = 0
   trailStarted = false
   trailHasSegment = false
@@ -507,11 +508,11 @@ function decayCrackMap() {
 
     const fresh = crackData[i + 1]!
     if (fresh > 0) {
-      crackData[i + 1] = Math.max(0, fresh - 2)
+      crackData[i + 1] = Math.max(0, fresh - 4)
     }
 
     const t = Math.min(1, crackData[i + 1]! / 75)
-    const decay = 0.99 + 0.01 * t
+    const decay = 0.97 + 0.03 * t
     const newVal = Math.floor(v * decay)
     crackData[i] = newVal
     crackData[i + 2] = newVal
@@ -593,7 +594,7 @@ function paintCrackMap() {
   if (segDist < MIN_SEG_DIST) return
 
   // If mouse jumped too far, restart trail
-  if (segDist > 0.15) {
+  if (segDist > 0.2) {
     lastSegX = mouse.current.x
     lastSegY = mouse.current.y
     trailHasSegment = false
@@ -606,24 +607,32 @@ function paintCrackMap() {
   const perpX = -ndy
   const perpY = ndx
 
-  // Wander trail width for irregular edges
+  // Wander left and right widths independently for asymmetric edges
   trailWidthTimer--
   if (trailWidthTimer <= 0) {
-    trailHalfWidthTarget = 0.02 + Math.random() * 0.05
-    trailWidthTimer = 2 + Math.floor(Math.random() * 8)
+    trailLeftHWTarget = 0.03 + Math.random() * 0.09
+    trailRightHWTarget = 0.03 + Math.random() * 0.09
+    trailWidthTimer = 2 + Math.floor(Math.random() * 5)
   }
-  trailHalfWidth += (trailHalfWidthTarget - trailHalfWidth) * 0.3
+  trailLeftHW += (trailLeftHWTarget - trailLeftHW) * 0.35
+  trailRightHW += (trailRightHWTarget - trailRightHW) * 0.35
 
-  const hw = trailHalfWidth * (0.8 + Math.random() * 0.4)
-  const newLX = mouse.current.x + perpX * hw
-  const newLY = mouse.current.y + perpY * hw
-  const newRX = mouse.current.x - perpX * hw
-  const newRY = mouse.current.y - perpY * hw
+  // Each vertex gets its own slight random nudge for irregularity
+  const lw = trailLeftHW * (0.8 + Math.random() * 0.4)
+  const rw = trailRightHW * (0.8 + Math.random() * 0.4)
+  const newLX = mouse.current.x + perpX * lw
+  const newLY = mouse.current.y + perpY * lw
+  const newRX = mouse.current.x - perpX * rw
+  const newRY = mouse.current.y - perpY * rw
 
   // Paint connecting quadrilateral between previous and new vertices
   if (trailHasSegment) {
     fillQuadOnCrackMap(prevLeftX, prevLeftY, newLX, newLY, newRX, newRY, prevRightX, prevRightY)
     crackTexture!.needsUpdate = true
+
+    // Spawn 2 shards peeling off each side of the path
+    spawnFragmentAtEdge(newLX, newLY, perpX, perpY)
+    spawnFragmentAtEdge(newRX, newRY, -perpX, -perpY)
   }
 
   prevLeftX = newLX
@@ -636,59 +645,51 @@ function paintCrackMap() {
 }
 
 // ── Fragment spawning ──
-function spawnFragment(mx: number, my: number, mvx: number, mvy: number) {
+// Spawn a shard peeling off the trail edge
+function spawnFragmentAtEdge(edgeX: number, edgeY: number, outX: number, outY: number) {
   const f = fragments[nextFragIdx % MAX_FRAGMENTS]!
   nextFragIdx++
 
-  const len = Math.sqrt(mvx * mvx + mvy * mvy)
-  if (len < 0.00001) return
+  // Position at the trail edge
+  f.x = edgeX * 2 - 1
+  f.y = edgeY * 2 - 1
 
-  const dirX = mvx / len
-  const dirY = mvy / len
-  const perpX = -dirY
-  const perpY = dirX
-
-  const side = Math.random() > 0.5 ? 1 : -1
-  const perpOff = (Math.random() * 0.006 + 0.001) * side
-  const behindOff = Math.random() * 0.004 + 0.001
-
-  const sx = mx - dirX * behindOff + perpX * perpOff
-  const sy = my - dirY * behindOff + perpY * perpOff
-
-  f.x = sx * 2 - 1
-  f.y = sy * 2 - 1
-
-  f.vx = perpX * side * (0.0002 + Math.random() * 0.0005)
-  f.vy = perpY * side * (0.0002 + Math.random() * 0.0005) - 0.00005
-
-  f.rotation = Math.random() * Math.PI * 2
-  f.rotSpeed = (Math.random() - 0.5) * 0.03
-  if (Math.random() < 0.2) {
-    lastFragSize = 50 + Math.random() * 50
+  // Drift outward from trail edge, progressively accelerating
+  const outLen = Math.sqrt(outX * outX + outY * outY)
+  if (outLen > 0.0001) {
+    const nx = outX / outLen
+    const ny = outY / outLen
+    f.vx = nx * (0.0015 + Math.random() * 0.002)
+    f.vy = ny * (0.0015 + Math.random() * 0.002)
+  } else {
+    f.vx = (Math.random() - 0.5) * 0.002
+    f.vy = (Math.random() - 0.5) * 0.002
   }
-  f.size = lastFragSize
-  f.opacity = 0.55 + Math.random() * 0.35
-  f.age = 0
-  f.maxAge = 50 + Math.random() * 70
 
-  // Generate irregular quadrilateral corners (shattered glass shard shape)
-  // Polar method: 4 corners at roughly cardinal angles with randomized
-  // distance and angle — guarantees convex polygon with organic irregularity
-  const angSpread = 0.5
+  f.rotation = Math.atan2(outY, outX) + (Math.random() - 0.5) * 0.5
+  f.rotSpeed = (Math.random() - 0.5) * 0.02
+  f.size = 80 + Math.random() * 320
+  f.opacity = 0.85
+  f.age = 0
+  f.maxAge = 80 + Math.random() * 40
+
+  // Generate irregular quadrilateral corners — wide variety of shapes
+  const angSpread = 0.9
   const angles = [
     Math.PI * 0.75 + (Math.random() - 0.5) * angSpread,
     Math.PI * 0.25 + (Math.random() - 0.5) * angSpread,
     -Math.PI * 0.25 + (Math.random() - 0.5) * angSpread,
     -Math.PI * 0.75 + (Math.random() - 0.5) * angSpread,
   ]
-  // Random stretch creates elongated or squashed shards
-  const sx2 = 0.7 + Math.random() * 0.6
-  const sy2 = 0.7 + Math.random() * 0.6
+  // Extreme stretch: some tall and thin, some wide and flat
+  const sx2 = 0.4 + Math.random() * 1.2
+  const sy2 = 0.4 + Math.random() * 1.2
 
-  const d0 = 0.2 + Math.random() * 0.18
-  const d1 = 0.2 + Math.random() * 0.18
-  const d2 = 0.2 + Math.random() * 0.18
-  const d3 = 0.2 + Math.random() * 0.18
+  // Very different distances per corner for irregular shapes
+  const d0 = 0.12 + Math.random() * 0.3
+  const d1 = 0.12 + Math.random() * 0.3
+  const d2 = 0.12 + Math.random() * 0.3
+  const d3 = 0.12 + Math.random() * 0.3
 
   f.v0x = Math.cos(angles[0]!) * d0 * sx2
   f.v0y = Math.sin(angles[0]!) * d0 * sy2
@@ -700,19 +701,6 @@ function spawnFragment(mx: number, my: number, mvx: number, mvy: number) {
   f.v3y = Math.sin(angles[3]!) * d3 * sy2
 
   f.alive = true
-}
-
-function spawnFragments() {
-  const dx = mouse.current.x - mouse.prev.x
-  const dy = mouse.current.y - mouse.prev.y
-  const velocity = Math.sqrt(dx * dx + dy * dy)
-  if (velocity < 0.0005) return
-
-  spawnAccumulator += velocity * 8
-  while (spawnAccumulator >= 1) {
-    spawnFragment(mouse.current.x, mouse.current.y, dx, dy)
-    spawnAccumulator -= 1
-  }
 }
 
 // ── Fragment update → GPU buffers ──
@@ -747,9 +735,9 @@ function updateFragments() {
     f.y += f.vy
     f.rotation += f.rotSpeed
 
-    if (f.age / f.maxAge > 0.6) {
-      f.opacity *= 0.96
-    }
+    // Smooth fade: start full, progressively fade to transparent
+    const life = f.age / f.maxAge
+    f.opacity = 0.85 * (1.0 - life * life)
 
     posArr[i * 3] = f.x
     posArr[i * 3 + 1] = f.y
@@ -798,7 +786,6 @@ function animate() {
 
   decayCrackMap()
   paintCrackMap()
-  spawnFragments()
   updateFragments()
 
   renderer.render(sceneObj, camera)

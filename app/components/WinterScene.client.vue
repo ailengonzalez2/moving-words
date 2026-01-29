@@ -98,10 +98,19 @@ let nextFragIdx = 0
 let spawnAccumulator = 0
 let lastFragSize = 50
 
-// Irregular crack width state
-let brushWidthWander = 1.0
-let brushWidthTarget = 1.0
-let brushWidthTimer = 0
+// Trail state for angular polygon path
+let trailHalfWidth = 0.04
+let trailHalfWidthTarget = 0.04
+let trailWidthTimer = 0
+let lastSegX = 0.5
+let lastSegY = 0.5
+let prevLeftX = 0
+let prevLeftY = 0
+let prevRightX = 0
+let prevRightY = 0
+let trailStarted = false
+let trailHasSegment = false
+const MIN_SEG_DIST = 0.025
 
 // ── Mouse handler ──
 function onMouseMove(e: MouseEvent) {
@@ -476,9 +485,11 @@ function init() {
   for (const f of fragments) f.alive = false
   nextFragIdx = 0
   spawnAccumulator = 0
-  brushWidthWander = 1.0
-  brushWidthTarget = 1.0
-  brushWidthTimer = 0
+  trailHalfWidth = 0.04
+  trailHalfWidthTarget = 0.04
+  trailWidthTimer = 0
+  trailStarted = false
+  trailHasSegment = false
   elapsedTime = 0
   mouse.active = false
 
@@ -496,11 +507,11 @@ function decayCrackMap() {
 
     const fresh = crackData[i + 1]!
     if (fresh > 0) {
-      crackData[i + 1] = Math.max(0, fresh - 3)
+      crackData[i + 1] = Math.max(0, fresh - 2)
     }
 
     const t = Math.min(1, crackData[i + 1]! / 75)
-    const decay = 0.95 + 0.05 * t
+    const decay = 0.99 + 0.01 * t
     const newVal = Math.floor(v * decay)
     crackData[i] = newVal
     crackData[i + 2] = newVal
@@ -508,7 +519,57 @@ function decayCrackMap() {
   crackTexture.needsUpdate = true
 }
 
-// ── Crack map painting ──
+// ── Quad rasterization helpers ──
+function cross2dNum(ax: number, ay: number, bx: number, by: number): number {
+  return ax * by - ay * bx
+}
+
+function pointInQuadTest(
+  px: number, py: number,
+  x0: number, y0: number,
+  x1: number, y1: number,
+  x2: number, y2: number,
+  x3: number, y3: number,
+): boolean {
+  const c0 = cross2dNum(x1 - x0, y1 - y0, px - x0, py - y0)
+  const c1 = cross2dNum(x2 - x1, y2 - y1, px - x1, py - y1)
+  const c2 = cross2dNum(x3 - x2, y3 - y2, px - x2, py - y2)
+  const c3 = cross2dNum(x0 - x3, y0 - y3, px - x3, py - y3)
+  return (c0 > 0 && c1 > 0 && c2 > 0 && c3 > 0) || (c0 < 0 && c1 < 0 && c2 < 0 && c3 < 0)
+}
+
+function fillQuadOnCrackMap(
+  ax: number, ay: number,
+  bx: number, by: number,
+  cx: number, cy: number,
+  dx: number, dy: number,
+) {
+  if (!crackData) return
+  // Convert UV (0-1) to pixel coords
+  const p0x = ax * CRACK_RES, p0y = ay * CRACK_RES
+  const p1x = bx * CRACK_RES, p1y = by * CRACK_RES
+  const p2x = cx * CRACK_RES, p2y = cy * CRACK_RES
+  const p3x = dx * CRACK_RES, p3y = dy * CRACK_RES
+
+  const minX = Math.max(0, Math.floor(Math.min(p0x, p1x, p2x, p3x)))
+  const maxX = Math.min(CRACK_RES - 1, Math.ceil(Math.max(p0x, p1x, p2x, p3x)))
+  const minY = Math.max(0, Math.floor(Math.min(p0y, p1y, p2y, p3y)))
+  const maxY = Math.min(CRACK_RES - 1, Math.ceil(Math.max(p0y, p1y, p2y, p3y)))
+
+  for (let py = minY; py <= maxY; py++) {
+    for (let px = minX; px <= maxX; px++) {
+      if (pointInQuadTest(px, py, p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y)) {
+        const idx = (py * CRACK_RES + px) * 4
+        crackData[idx] = 255
+        crackData[idx + 1] = 255
+        crackData[idx + 2] = 255
+        crackData[idx + 3] = 255
+      }
+    }
+  }
+}
+
+// ── Crack map painting (angular polygon trail) ──
 function paintCrackMap() {
   if (!crackData || !crackTexture) return
 
@@ -517,44 +578,61 @@ function paintCrackMap() {
   const velocity = Math.sqrt(dx * dx + dy * dy)
   if (velocity < 0.0001) return
 
-  // Wander the brush width for irregular crack thickness
-  brushWidthTimer--
-  if (brushWidthTimer <= 0) {
-    brushWidthTarget = 0.4 + Math.random() * 1.2
-    brushWidthTimer = 3 + Math.floor(Math.random() * 15)
-  }
-  brushWidthWander += (brushWidthTarget - brushWidthWander) * 0.1
-
-  const dynamicRadius = (BRUSH_RADIUS + velocity * 120) * brushWidthWander
-  const strength = PAINT_STRENGTH * Math.min(velocity * 25, 1.0)
-
-  const cx = mouse.current.x * CRACK_RES
-  const cy = mouse.current.y * CRACK_RES
-  const r = Math.ceil(dynamicRadius)
-  const xMin = Math.max(0, Math.floor(cx - r))
-  const xMax = Math.min(CRACK_RES - 1, Math.ceil(cx + r))
-  const yMin = Math.max(0, Math.floor(cy - r))
-  const yMax = Math.min(CRACK_RES - 1, Math.ceil(cy + r))
-
-  for (let py = yMin; py <= yMax; py++) {
-    for (let px = xMin; px <= xMax; px++) {
-      const tdx = px - cx
-      const tdy = py - cy
-      const dist = Math.sqrt(tdx * tdx + tdy * tdy)
-
-      if (dist > dynamicRadius) continue
-      const t = dist / dynamicRadius
-      const falloff = 1.0 - t * t * (3.0 - 2.0 * t)
-      const idx = (py * CRACK_RES + px) * 4
-      const newVal = Math.min(255, crackData[idx]! + falloff * strength * 255)
-      crackData[idx] = newVal
-      crackData[idx + 1] = 255
-      crackData[idx + 2] = newVal
-      crackData[idx + 3] = 255
-    }
+  // Initialize trail start position
+  if (!trailStarted) {
+    lastSegX = mouse.current.x
+    lastSegY = mouse.current.y
+    trailStarted = true
+    return
   }
 
-  crackTexture.needsUpdate = true
+  // Check minimum distance for a new segment
+  const segDx = mouse.current.x - lastSegX
+  const segDy = mouse.current.y - lastSegY
+  const segDist = Math.sqrt(segDx * segDx + segDy * segDy)
+  if (segDist < MIN_SEG_DIST) return
+
+  // If mouse jumped too far, restart trail
+  if (segDist > 0.15) {
+    lastSegX = mouse.current.x
+    lastSegY = mouse.current.y
+    trailHasSegment = false
+    return
+  }
+
+  // Direction and perpendicular
+  const ndx = segDx / segDist
+  const ndy = segDy / segDist
+  const perpX = -ndy
+  const perpY = ndx
+
+  // Wander trail width for irregular edges
+  trailWidthTimer--
+  if (trailWidthTimer <= 0) {
+    trailHalfWidthTarget = 0.02 + Math.random() * 0.05
+    trailWidthTimer = 2 + Math.floor(Math.random() * 8)
+  }
+  trailHalfWidth += (trailHalfWidthTarget - trailHalfWidth) * 0.3
+
+  const hw = trailHalfWidth * (0.8 + Math.random() * 0.4)
+  const newLX = mouse.current.x + perpX * hw
+  const newLY = mouse.current.y + perpY * hw
+  const newRX = mouse.current.x - perpX * hw
+  const newRY = mouse.current.y - perpY * hw
+
+  // Paint connecting quadrilateral between previous and new vertices
+  if (trailHasSegment) {
+    fillQuadOnCrackMap(prevLeftX, prevLeftY, newLX, newLY, newRX, newRY, prevRightX, prevRightY)
+    crackTexture!.needsUpdate = true
+  }
+
+  prevLeftX = newLX
+  prevLeftY = newLY
+  prevRightX = newRX
+  prevRightY = newRY
+  trailHasSegment = true
+  lastSegX = mouse.current.x
+  lastSegY = mouse.current.y
 }
 
 // ── Fragment spawning ──
@@ -571,8 +649,8 @@ function spawnFragment(mx: number, my: number, mvx: number, mvy: number) {
   const perpY = dirX
 
   const side = Math.random() > 0.5 ? 1 : -1
-  const perpOff = (Math.random() * 0.012 + 0.002) * side
-  const behindOff = Math.random() * 0.01 + 0.005
+  const perpOff = (Math.random() * 0.006 + 0.001) * side
+  const behindOff = Math.random() * 0.004 + 0.001
 
   const sx = mx - dirX * behindOff + perpX * perpOff
   const sy = my - dirY * behindOff + perpY * perpOff
@@ -580,8 +658,8 @@ function spawnFragment(mx: number, my: number, mvx: number, mvy: number) {
   f.x = sx * 2 - 1
   f.y = sy * 2 - 1
 
-  f.vx = perpX * side * (0.0006 + Math.random() * 0.002)
-  f.vy = perpY * side * (0.0006 + Math.random() * 0.002) - 0.0002
+  f.vx = perpX * side * (0.0002 + Math.random() * 0.0005)
+  f.vy = perpY * side * (0.0002 + Math.random() * 0.0005) - 0.00005
 
   f.rotation = Math.random() * Math.PI * 2
   f.rotSpeed = (Math.random() - 0.5) * 0.03
@@ -591,7 +669,7 @@ function spawnFragment(mx: number, my: number, mvx: number, mvy: number) {
   f.size = lastFragSize
   f.opacity = 0.55 + Math.random() * 0.35
   f.age = 0
-  f.maxAge = 90 + Math.random() * 120
+  f.maxAge = 50 + Math.random() * 70
 
   // Generate irregular quadrilateral corners (shattered glass shard shape)
   // Polar method: 4 corners at roughly cardinal angles with randomized

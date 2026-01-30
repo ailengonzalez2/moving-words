@@ -54,7 +54,7 @@ let elapsedTime = 0
 const CRACK_RES = 512
 const BRUSH_RADIUS = 30
 const PAINT_STRENGTH = 0.4
-const LERP_FACTOR = 0.12
+const LERP_FACTOR = 0.22
 const MAX_FRAGMENTS = 4
 
 // Mouse state (UV space: 0–1)
@@ -75,7 +75,7 @@ interface Fragment {
   opacity: number
   age: number
   maxAge: number
-  // 4 corners of irregular quadrilateral (local space within [-0.5, 0.5])
+  // Snowflake shape parameters (armW, sub1Pos, sub1Len, sub2Pos, sub2Len, centerR, subAngle, subWidthR)
   v0x: number; v0y: number
   v1x: number; v1y: number
   v2x: number; v2y: number
@@ -104,13 +104,18 @@ let trailRightHWTarget = 0.06
 let trailWidthTimer = 0
 let lastSegX = 0.5
 let lastSegY = 0.5
-let prevLeftX = 0
-let prevLeftY = 0
-let prevRightX = 0
-let prevRightY = 0
 let trailStarted = false
-let trailHasSegment = false
-const MIN_SEG_DIST = 0.045
+const MIN_SEG_DIST = 0.018
+
+// Tip taper: leading edge narrows to a point, widens quickly behind
+const TAPER_SEGS = 8
+const TIP_FACTOR = 0.06
+interface TaperSeg {
+  cx: number; cy: number
+  px: number; py: number
+  lw: number; rw: number
+}
+const taperBuffer: TaperSeg[] = []
 
 // ── Mouse handler ──
 function onMouseMove(e: MouseEvent) {
@@ -220,7 +225,7 @@ void main() {
 }
 `
 
-// ── Fragment particle shader (irregular polygon shards) ──
+// ── Fragment particle shader (snowflakes) ──
 const fragVertex = /* glsl */ `
 attribute float aOpacity;
 attribute float aRotation;
@@ -252,15 +257,53 @@ varying float vRotation;
 varying vec4 vV01;
 varying vec4 vV23;
 
-float cross2d(vec2 a, vec2 b) {
-  return a.x * b.y - a.y * b.x;
+// SDF for a rounded line segment
+float sdSeg(vec2 p, vec2 a, vec2 b, float hw) {
+  vec2 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * h) - hw;
 }
 
-float distToSegment(vec2 p, vec2 a, vec2 b) {
-  vec2 ab = b - a;
-  vec2 ap = p - a;
-  float t = clamp(dot(ap, ab) / dot(ab, ab), 0.0, 1.0);
-  return length(p - (a + ab * t));
+// Snowflake SDF: 6-fold symmetric branches with sub-branches
+float snowflake(vec2 p, float armW, float armLen, float s1Pos, float s1Len,
+                float s2Pos, float s2Len, float ctrR, float sAng, float sW) {
+  // Center dot
+  float d = length(p) - ctrR;
+
+  for (int i = 0; i < 6; i++) {
+    float a = float(i) * 1.0471975; // 2*PI / 6
+    float ca = cos(a), sa = sin(a);
+    vec2 dir  = vec2(ca, sa);
+    vec2 perp = vec2(-sa, ca);
+
+    // Main arm
+    d = min(d, sdSeg(p, vec2(0.0), dir * armLen, armW));
+
+    // Sub-branch directions (forking outward)
+    float sca = cos(sAng), ssa = sin(sAng);
+    vec2 sd1 = dir * sca - perp * ssa;
+    vec2 sd2 = dir * sca + perp * ssa;
+
+    // Sub-branches at first position
+    vec2 bp1 = dir * s1Pos;
+    d = min(d, sdSeg(p, bp1, bp1 + sd1 * s1Len, sW));
+    d = min(d, sdSeg(p, bp1, bp1 + sd2 * s1Len, sW));
+
+    // Sub-branches at second position
+    vec2 bp2 = dir * s2Pos;
+    d = min(d, sdSeg(p, bp2, bp2 + sd1 * s2Len, sW));
+    d = min(d, sdSeg(p, bp2, bp2 + sd2 * s2Len, sW));
+
+    // Rounded tip fork at arm end
+    vec2 tip = dir * armLen * 0.88;
+    d = min(d, sdSeg(p, tip, tip + sd1 * s2Len * 0.55, sW * 0.8));
+    d = min(d, sdSeg(p, tip, tip + sd2 * s2Len * 0.55, sW * 0.8));
+
+    // Rounded bulb at each arm tip
+    d = min(d, length(p - dir * armLen) - armW * 1.3);
+  }
+
+  return d;
 }
 
 void main() {
@@ -271,58 +314,86 @@ void main() {
   float s = sin(vRotation);
   uv = vec2(uv.x * c - uv.y * s, uv.x * s + uv.y * c);
 
-  // Reconstruct 4 corners of the irregular quadrilateral
-  vec2 v0 = vV01.xy;
-  vec2 v1 = vV01.zw;
-  vec2 v2 = vV23.xy;
-  vec2 v3 = vV23.zw;
+  // Quick circular clip
+  if (length(uv) > 0.48) discard;
 
-  // Point-in-convex-quad test (works for CW or CCW winding)
-  float c0 = cross2d(v1 - v0, uv - v0);
-  float c1 = cross2d(v2 - v1, uv - v1);
-  float c2 = cross2d(v3 - v2, uv - v2);
-  float c3 = cross2d(v0 - v3, uv - v3);
+  // Snowflake parameters from attributes
+  float armW    = vV01.x;
+  float s1Pos   = vV01.y;
+  float s1Len   = vV01.z;
+  float s2Pos   = vV01.w;
+  float s2Len   = vV23.x;
+  float ctrR    = vV23.y;
+  float sAng    = vV23.z;
+  float sWidthR = vV23.w;
+  float sW      = armW * sWidthR;
+  float armLen  = 0.38;
 
-  bool allPos = c0 > 0.0 && c1 > 0.0 && c2 > 0.0 && c3 > 0.0;
-  bool allNeg = c0 < 0.0 && c1 < 0.0 && c2 < 0.0 && c3 < 0.0;
-  if (!(allPos || allNeg)) discard;
+  float d = snowflake(uv, armW, armLen, s1Pos, s1Len, s2Pos, s2Len, ctrR, sAng, sW);
 
-  // Distance to nearest edge for anti-aliasing and bevel
-  float e0 = distToSegment(uv, v0, v1);
-  float e1 = distToSegment(uv, v1, v2);
-  float e2 = distToSegment(uv, v2, v3);
-  float e3 = distToSegment(uv, v3, v0);
-  float minEdge = min(min(e0, e1), min(e2, e3));
+  // Wider threshold for puffy rounded edges
+  if (d > 0.015) discard;
 
-  // Smooth anti-aliasing at edges
-  float aa = smoothstep(0.0, 0.012, minEdge);
+  // Dome-shaped height profile for puffy 3D look
+  float height = smoothstep(0.015, -0.06, d);
+  float dome = sqrt(height);
 
-  // Edge bevel darkening (thicker shards feel)
-  float bevel = smoothstep(0.0, 0.07, minEdge);
+  // Surface normal from dome height gradient
+  vec3 normal = normalize(vec3(-dFdx(dome) * 22.0, -dFdy(dome) * 22.0, 1.0));
 
-  // Face normal: slightly tilted based on shape asymmetry (glass shard effect)
-  vec2 center = (v0 + v1 + v2 + v3) * 0.25;
-  vec3 faceN = normalize(vec3(-center * 0.6, 1.0));
-
-  // Directional lighting (matches background bevel light)
-  vec3 lightDir = normalize(vec3(-0.5, 0.5, 1.0));
-  float diffuse = max(dot(faceN, lightDir), 0.0);
-  float lighting = 0.25 + diffuse * 0.75;
-
-  // Sharp specular for glass-like highlight
+  // View direction (straight on)
   vec3 viewDir = vec3(0.0, 0.0, 1.0);
+
+  // Main directional light (top-right, forward)
+  vec3 lightDir = normalize(vec3(0.4, 0.6, 0.9));
+  float diffuse = max(dot(normal, lightDir), 0.0);
+  float wrapDiffuse = dot(normal, lightDir) * 0.5 + 0.5;
+
+  // Fill light from opposite side (softer)
+  vec3 fillDir = normalize(vec3(-0.3, -0.2, 0.7));
+  float fillDiffuse = max(dot(normal, fillDir), 0.0) * 0.3;
+
+  // Glossy specular highlight (sharp)
   vec3 halfVec = normalize(lightDir + viewDir);
-  float spec = pow(max(dot(faceN, halfVec), 0.0), 24.0);
+  float spec = pow(max(dot(normal, halfVec), 0.0), 80.0);
 
-  // Dark surface fragment color
-  vec3 baseCol = vec3(0.12, 0.12, 0.14);
-  vec3 col = baseCol * lighting + vec3(1.0) * spec * 0.18;
+  // Broader soft specular (sheen)
+  float softSpec = pow(max(dot(normal, halfVec), 0.0), 16.0);
 
-  // Bevel: darken edges with subtle cool tint
-  col *= mix(0.5, 1.0, bevel);
-  col += vec3(0.02, 0.03, 0.06) * (1.0 - bevel);
+  // Fresnel effect (translucent edge glow like ice)
+  float fresnel = 1.0 - max(dot(normal, viewDir), 0.0);
+  fresnel = fresnel * fresnel * fresnel;
 
-  gl_FragColor = vec4(col, vOpacity * aa);
+  // Ice blue color palette
+  vec3 iceBlue    = vec3(0.78, 0.91, 0.98);  // Light ice
+  vec3 deepIce    = vec3(0.62, 0.80, 0.93);  // Shadow tone
+  vec3 highlight  = vec3(0.93, 0.97, 1.0);   // Near-white lit areas
+  vec3 rimColor   = vec3(0.85, 0.93, 1.0);   // Fresnel edge
+
+  // Base color: blend between shadow and lit tones
+  vec3 col = mix(deepIce, iceBlue, wrapDiffuse);
+
+  // Add fill light contribution
+  col += iceBlue * fillDiffuse;
+
+  // Brighten lit surfaces toward white
+  col = mix(col, highlight, diffuse * 0.45);
+
+  // Fresnel rim (translucent ice edges glow lighter)
+  col = mix(col, rimColor, fresnel * 0.4);
+
+  // Glossy specular highlights
+  col += vec3(1.0) * spec * 0.6;
+  col += vec3(0.92, 0.96, 1.0) * softSpec * 0.2;
+
+  // Edge bevel polish
+  float bevel = smoothstep(0.015, -0.025, d);
+  col *= mix(0.88, 1.0, bevel);
+
+  // Anti-aliased edge
+  float aa = smoothstep(0.015, 0.003, d);
+
+  gl_FragColor = vec4(col, vOpacity * aa * 0.92);
 }
 `
 
@@ -490,7 +561,7 @@ function init() {
   trailRightHWTarget = 0.06
   trailWidthTimer = 0
   trailStarted = false
-  trailHasSegment = false
+  taperBuffer.length = 0
   elapsedTime = 0
   mouse.active = false
 
@@ -570,7 +641,7 @@ function fillQuadOnCrackMap(
   }
 }
 
-// ── Crack map painting (angular polygon trail) ──
+// ── Crack map painting (angular polygon trail with tapered tip) ──
 function paintCrackMap() {
   if (!crackData || !crackTexture) return
 
@@ -597,7 +668,7 @@ function paintCrackMap() {
   if (segDist > 0.2) {
     lastSegX = mouse.current.x
     lastSegY = mouse.current.y
-    trailHasSegment = false
+    taperBuffer.length = 0
     return
   }
 
@@ -617,29 +688,54 @@ function paintCrackMap() {
   trailLeftHW += (trailLeftHWTarget - trailLeftHW) * 0.35
   trailRightHW += (trailRightHWTarget - trailRightHW) * 0.35
 
-  // Each vertex gets its own slight random nudge for irregularity
+  // Full-width values (same as before, no ramp)
   const lw = trailLeftHW * (0.8 + Math.random() * 0.4)
   const rw = trailRightHW * (0.8 + Math.random() * 0.4)
-  const newLX = mouse.current.x + perpX * lw
-  const newLY = mouse.current.y + perpY * lw
-  const newRX = mouse.current.x - perpX * rw
-  const newRY = mouse.current.y - perpY * rw
 
-  // Paint connecting quadrilateral between previous and new vertices
-  if (trailHasSegment) {
-    fillQuadOnCrackMap(prevLeftX, prevLeftY, newLX, newLY, newRX, newRY, prevRightX, prevRightY)
-    crackTexture!.needsUpdate = true
+  // Add new segment to taper buffer
+  taperBuffer.push({ cx: mouse.current.x, cy: mouse.current.y, px: perpX, py: perpY, lw, rw })
 
-    // Spawn 2 shards peeling off each side of the path
-    spawnFragmentAtEdge(newLX, newLY, perpX, perpY)
-    spawnFragmentAtEdge(newRX, newRY, -perpX, -perpY)
+  // Repaint all consecutive pairs with taper (newest = thin tip, older = full width)
+  const len = taperBuffer.length
+  for (let i = 1; i < len; i++) {
+    const prev = taperBuffer[i - 1]!
+    const curr = taperBuffer[i]!
+
+    // Distance from tip: newest (i = len-1) = 0, older = higher
+    const prevFromTip = len - i
+    const currFromTip = len - 1 - i
+
+    // Taper factor: 0 at tip → 1 at TAPER_SEGS distance
+    const pf = Math.min(1.0, prevFromTip / TAPER_SEGS) * (1.0 - TIP_FACTOR) + TIP_FACTOR
+    const cf = Math.min(1.0, currFromTip / TAPER_SEGS) * (1.0 - TIP_FACTOR) + TIP_FACTOR
+
+    const pLX = prev.cx + prev.px * prev.lw * pf
+    const pLY = prev.cy + prev.py * prev.lw * pf
+    const pRX = prev.cx - prev.px * prev.rw * pf
+    const pRY = prev.cy - prev.py * prev.rw * pf
+
+    const cLX = curr.cx + curr.px * curr.lw * cf
+    const cLY = curr.cy + curr.py * curr.lw * cf
+    const cRX = curr.cx - curr.px * curr.rw * cf
+    const cRY = curr.cy - curr.py * curr.rw * cf
+
+    fillQuadOnCrackMap(pLX, pLY, cLX, cLY, cRX, cRY, pRX, pRY)
   }
 
-  prevLeftX = newLX
-  prevLeftY = newLY
-  prevRightX = newRX
-  prevRightY = newRY
-  trailHasSegment = true
+  crackTexture!.needsUpdate = true
+
+  // Spawn snowflakes at the newest segment's full-width edges
+  if (len >= 2) {
+    const seg = taperBuffer[len - 1]!
+    spawnFragmentAtEdge(seg.cx + seg.px * seg.lw, seg.cy + seg.py * seg.lw, seg.px, seg.py)
+    spawnFragmentAtEdge(seg.cx - seg.px * seg.rw, seg.cy - seg.py * seg.rw, -seg.px, -seg.py)
+  }
+
+  // Trim buffer: keep enough for taper + margin
+  while (taperBuffer.length > TAPER_SEGS + 2) {
+    taperBuffer.shift()
+  }
+
   lastSegX = mouse.current.x
   lastSegY = mouse.current.y
 }
@@ -666,39 +762,22 @@ function spawnFragmentAtEdge(edgeX: number, edgeY: number, outX: number, outY: n
     f.vy = (Math.random() - 0.5) * 0.002
   }
 
-  f.rotation = Math.atan2(outY, outX) + (Math.random() - 0.5) * 0.5
-  f.rotSpeed = (Math.random() - 0.5) * 0.02
-  f.size = 80 + Math.random() * 320
+  f.rotation = Math.random() * Math.PI * 2
+  f.rotSpeed = (Math.random() - 0.5) * 0.03
+  f.size = 45 + Math.random() * 75
   f.opacity = 0.85
   f.age = 0
   f.maxAge = 80 + Math.random() * 40
 
-  // Generate irregular quadrilateral corners — wide variety of shapes
-  const angSpread = 0.9
-  const angles = [
-    Math.PI * 0.75 + (Math.random() - 0.5) * angSpread,
-    Math.PI * 0.25 + (Math.random() - 0.5) * angSpread,
-    -Math.PI * 0.25 + (Math.random() - 0.5) * angSpread,
-    -Math.PI * 0.75 + (Math.random() - 0.5) * angSpread,
-  ]
-  // Extreme stretch: some tall and thin, some wide and flat
-  const sx2 = 0.4 + Math.random() * 1.2
-  const sy2 = 0.4 + Math.random() * 1.2
-
-  // Very different distances per corner for irregular shapes
-  const d0 = 0.12 + Math.random() * 0.3
-  const d1 = 0.12 + Math.random() * 0.3
-  const d2 = 0.12 + Math.random() * 0.3
-  const d3 = 0.12 + Math.random() * 0.3
-
-  f.v0x = Math.cos(angles[0]!) * d0 * sx2
-  f.v0y = Math.sin(angles[0]!) * d0 * sy2
-  f.v1x = Math.cos(angles[1]!) * d1 * sx2
-  f.v1y = Math.sin(angles[1]!) * d1 * sy2
-  f.v2x = Math.cos(angles[2]!) * d2 * sx2
-  f.v2y = Math.sin(angles[2]!) * d2 * sy2
-  f.v3x = Math.cos(angles[3]!) * d3 * sx2
-  f.v3y = Math.sin(angles[3]!) * d3 * sy2
+  // Snowflake shape parameters (thick puffy ice-like branches)
+  f.v0x = 0.028 + Math.random() * 0.016   // armWidth (wider for puffy look)
+  f.v0y = 0.10 + Math.random() * 0.10     // sub-branch 1 position
+  f.v1x = 0.07 + Math.random() * 0.07     // sub-branch 1 length
+  f.v1y = 0.20 + Math.random() * 0.10     // sub-branch 2 position
+  f.v2x = 0.05 + Math.random() * 0.05     // sub-branch 2 length
+  f.v2y = 0.05 + Math.random() * 0.03     // center radius (larger)
+  f.v3x = 0.7 + Math.random() * 0.5       // sub-branch fork angle
+  f.v3y = 0.75 + Math.random() * 0.25     // sub-branch width ratio (fatter)
 
   f.alive = true
 }
